@@ -1,0 +1,107 @@
+name: RDP2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Firewall rule for RDP
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User from Secrets
+        run: |
+          $username = "${{ secrets.NAME }}"
+          $password = "${{ secrets.PASS }}"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          # Create the user if not exists
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+          }
+
+          # Add to required groups
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+
+          # Remove the default "RDP" account if present
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name "RDP"
+          }
+
+          # Registry tweak: hide all users except our custom one
+          $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList"
+          if (-not (Test-Path $regPath)) {
+              New-Item -Path $regPath -Force | Out-Null
+          }
+
+          # Hide all users
+          Get-LocalUser | ForEach-Object {
+              New-ItemProperty -Path $regPath -Name $_.Name -Value 0 -PropertyType DWord -Force
+          }
+
+          # Unhide only the chosen user
+          New-ItemProperty -Path $regPath -Name $username -Value 1 -PropertyType DWord -Force
+
+          echo "RDP_CREDS=User: $username | Password: $password" >> $env:GITHUB_ENV
+
+      - name: Clean Azure/Assure/Unity Shortcuts
+        run: |
+          # Remove Azure / Assure / Unity shortcuts from Desktop
+          Get-ChildItem "C:\Users\Public\Desktop" | Where-Object { $_.Name -match "Azure|Assure|Unity" } | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+
+          # Remove Azure / Assure / Unity items from Start Menu (Public Programs)
+          Get-ChildItem "C:\ProgramData\Microsoft\Windows\Start Menu\Programs" -Recurse | Where-Object { $_.Name -match "Azure|Assure|Unity" } | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null; $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5; $retries++
+          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned. Exiting."; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) { Write-Error "TCP 3389 failed"; exit 1 }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: $(${env:RDP_CREDS}.Split('|')[0].Split(':')[1].Trim())"
+          Write-Host "Password: $(${env:RDP_CREDS}.Split('|')[1].Split(':')[1].Trim())"
+          Write-Host "==================`n"
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
