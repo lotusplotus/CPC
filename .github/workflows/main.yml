@@ -28,6 +28,13 @@ jobs:
         run: |
           $username = "${{ secrets.NAME }}"
           $password = "${{ secrets.PASS }}"
+
+          # Disable password complexity policy so any password works
+          secedit /export /cfg $env:TEMP\secpol.cfg
+          (Get-Content $env:TEMP\secpol.cfg).Replace("PasswordComplexity = 1", "PasswordComplexity = 0") | Set-Content $env:TEMP\secpol.cfg
+          secedit /configure /db secedit.sdb /cfg $env:TEMP\secpol.cfg /areas SECURITYPOLICY
+          gpupdate /force
+
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
           # Create the user if not exists
